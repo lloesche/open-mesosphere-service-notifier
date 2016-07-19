@@ -5,12 +5,11 @@ import logging
 import shodan
 from pprint import pprint
 from ipwhois import IPWhois
+from multiprocessing.pool import ThreadPool
 
 TAKE_SCREENSHOT = True
 try:
-    from PySide.QtCore import QUrl, QBuffer, QByteArray
-    from PySide.QtGui import QApplication, QImage, QPainter
-    from PySide.QtWebKit import QWebView
+    from selenium import webdriver
 except ImportError:
     TAKE_SCREENSHOT = False
     pass
@@ -31,67 +30,49 @@ def main(argv):
 
 
 class OpenServices:
-    def __init__(self, api_key, take_screenshot = False):
+    def __init__(self, api_key, _screenshot = False):
         self.log = logging.getLogger(self.__class__.__name__)
-        self.api = shodan.Shodan(api_key)
-        self._screenshot = Screenshot() if take_screenshot else None
+        self.shodan = shodan.Shodan(api_key)
+        self._screenshot = _screenshot
+        self.tp = ThreadPool(10)
 
     def marathons(self):
         return self.search('X-Marathon-Leader')
 
+    def process(self, shodan_data):
+        self.log.debug('Processing IP {}'.format(shodan_data['ip_str']))
+        data = {'shodan': shodan_data,
+                'whois': self.whois(shodan_data['ip_str']),
+                'screen': self.screenshot(shodan_data['ip_str'], shodan_data['port'])}
+        pprint(data)
+
     def search(self, what):
         try:
-            results = self.api.search(what)
+            results = self.shodan.search(what)
             self.log.info('Results found: {}'.format(results['total']))
-            for shodan_data in results['matches']:
-                print('IP: %s' % shodan_data['ip_str'])
-                whois = IPWhois(shodan_data['ip_str'])
-                whois_data = whois.lookup_rdap(depth=1)
-                screen_data = self.screenshot(shodan_data['ip_str'], shodan_data['port'])
-                data = {'shodan': shodan_data,
-                        'whois':  whois_data,
-                        'screen': screen_data}
-                pprint(data)
+            self.tp.map(self.process, results['matches'])
 
         except shodan.APIError as e:
             self.log.error('Shodan API Error: {}'.format(e))
 
+    def whois(self, ip):
+        self.log.debug('Fetching WHOIS data for {}'.format(ip))
+        w = IPWhois(ip, timeout=10)
+        return w.lookup_rdap(depth=1, retry_count=5, rate_limit_timeout=60)
+
     def screenshot(self, host, port):
         if self._screenshot:
-            url = 'http://{}:{}/'.format(host, port)
+            if ':' in host:
+                url = 'http://[{}]:{}/'.format(host, port)
+            else:
+                url = 'http://{}:{}/'.format(host, port)
             self.log.debug('Capturing screenshot of {}'.format(url))
-            return self._screenshot.capture(url)
-
-
-class Screenshot(QWebView):
-    def __init__(self):
-        self.app = QApplication(sys.argv)
-        QWebView.__init__(self)
-        self._loaded = False
-        self.loadFinished.connect(self._load_finished)
-
-    def capture(self, url):
-        self.load(QUrl(url))
-        self.wait_load()
-        frame = self.page().mainFrame()
-        self.resize(frame.contentsSize())
-        self.page().setViewportSize(frame.contentsSize())
-        image = QImage(self.page().viewportSize(), QImage.Format_ARGB32)
-        painter = QPainter(image)
-        frame.render(painter)
-        painter.end()
-        data = QByteArray()
-        buf = QBuffer(data)
-        image.save(buf, 'PNG')
-        return data.toBase64()
-
-    def wait_load(self):
-        while not self._loaded:
-            self.app.processEvents()
-        self._loaded = False
-
-    def _load_finished(self, result):
-        self._loaded = True
+            browser = webdriver.PhantomJS()
+            browser.set_window_size(1024, 768)
+            browser.get(url)
+            png = browser.get_screenshot_as_base64()
+            browser.quit()
+            return png
 
 
 if __name__ == "__main__":
